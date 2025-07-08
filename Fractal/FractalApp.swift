@@ -11,7 +11,7 @@ import SwiftUI
 struct FractalApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            FractalView()
         }
     }
 }
