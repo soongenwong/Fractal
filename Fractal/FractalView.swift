@@ -1,298 +1,176 @@
 import SwiftUI
 
-// MARK: - API Helper Structs (Normally in their own files)
+// MARK: - Data Models & API Helpers (Kept in this file as requested)
 
-/// A helper to safely load the API key from the Secrets.plist file.
+/// Represents a single, trackable goal with its deconstructed steps.
+struct Goal: Identifiable, Codable {
+    let id: UUID
+    var title: String
+    var steps: [String]
+    var isLoading: Bool = false
+}
+
+// Custom Error type for our API calls
+enum APIError: Error, LocalizedError {
+    case missingAPIKey, invalidURL, requestFailed(Error), decodingFailed(Error), noContent, parsingFailed
+    
+    var errorDescription: String? {
+        switch self {
+        case .missingAPIKey: "API Key is missing. Please add it to Secrets.plist."
+        case .invalidURL: "The API endpoint URL is invalid."
+        case .requestFailed: "The network request failed. Please check your connection."
+        case .decodingFailed: "Failed to process the response from the server."
+        case .noContent: "The AI returned no content. Please try again."
+        case .parsingFailed: "Could not parse the steps from the AI's response."
+        }
+    }
+}
+
+// API Key Loader
 struct Secrets {
     static var apiKey: String {
         guard let url = Bundle.main.url(forResource: "Secrets", withExtension: "plist"),
               let data = try? Data(contentsOf: url),
-              let secrets = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
-            return ""
-        }
+              let secrets = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { return "" }
         return secrets["GroqAPIKey"] as? String ?? ""
     }
 }
 
-/// Codable structs to represent the JSON data for the Groq API request.
-struct GroqRequest: Codable {
-    let messages: [Message]
-    let model: String
-}
-
-struct Message: Codable {
-    let role: String
-    let content: String
-}
-
-/// Codable structs to decode the JSON data from the Groq API response.
-struct GroqResponse: Codable {
-    let choices: [Choice]
-}
-
-struct Choice: Codable {
-    let message: ResponseMessage
-}
-
-struct ResponseMessage: Codable {
-    let role: String
-    let content: String
-}
-
-/// Custom Error type for our API calls
-enum APIError: Error, LocalizedError {
-    case missingAPIKey
-    case invalidURL
-    case requestFailed(Error)
-    case decodingFailed(Error)
-    case noContent
-    
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "API Key is missing. Please add it to Secrets.plist."
-        case .invalidURL:
-            return "The API endpoint URL is invalid."
-        case .requestFailed:
-            return "The network request failed. Please check your connection."
-        case .decodingFailed:
-            return "Failed to process the response from the server."
-        case .noContent:
-            return "The AI returned no content. Please try again."
-        }
-    }
-}
+// Groq API Codable Structs
+struct GroqRequest: Codable { let messages: [Message]; let model: String }
+struct Message: Codable { let role: String; let content: String }
+struct GroqResponse: Codable { let choices: [Choice] }
+struct Choice: Codable { let message: ResponseMessage }
+struct ResponseMessage: Codable { let role: String; let content: String }
 
 
-// MARK: - Main View
+// MARK: - Main View Controller
 
-// This view encapsulates the entire user experience for the Fractal app.
 struct FractalView: View {
-
-    // MARK: - State Management
+    // AppStorage is used to persist the goals array on the device.
+    @AppStorage("userGoals") private var goalsData: Data?
     
-    private enum AppState {
-        case enteringGoal
-        case deconstructing
-        case showingFirstStep
-    }
+    // The main state for our goals list. Loaded from AppStorage.
+    @State private var goals: [Goal] = []
     
-    @State private var currentAppState: AppState = .enteringGoal
-    @State private var userGoal: String = ""
-    @State private var firstStep: String = ""
-    
-    // New state for handling API errors
+    // State to control the presentation of the "Add Goal" sheet and alerts.
+    @State private var isShowingAddSheet = false
     @State private var apiError: APIError?
     @State private var isShowingErrorAlert = false
     
-    private let hapticGenerator = UIImpactFeedbackGenerator(style: .medium)
-
-    // MARK: - Core View
-    
     var body: some View {
-        ZStack {
-            Color(UIColor.systemGroupedBackground).ignoresSafeArea()
-            
-            switch currentAppState {
-            case .enteringGoal:
-                goalEntryView
-                    .transition(.opacity)
-            case .deconstructing:
-                deconstructingView
-                    .transition(.opacity)
-            case .showingFirstStep:
-                firstStepView
-                    .transition(.opacity)
-            }
-        }
-        // Alert to show the user if an API error occurs
-        .alert("Error", isPresented: $isShowingErrorAlert, presenting: apiError) { error in
-            Button("OK") {}
-        } message: { error in
-            Text(error.localizedDescription)
-        }
-    }
-    
-    // MARK: - Subviews (No changes here, they adapt to state)
-
-    private var goalEntryView: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            
-            Image(systemName: "sparkles")
-                .font(.system(size: 50))
-                .foregroundColor(.accentColor)
-            
-            Text("Fractal")
-                .font(.system(size: 48, weight: .bold, design: .rounded))
-                .foregroundColor(.primary)
-
-            Text("Tell me a huge, intimidating goal. \nI'll give you the first, tiny step.")
-                .font(.headline)
-                .fontWeight(.medium)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-
-            TextField("e.g., Run a marathon, write a novel...", text: $userGoal)
-                .textFieldStyle(.plain)
-                .padding()
-                .background(Color(UIColor.systemBackground))
-                .cornerRadius(12)
-                .font(.title3)
-                .shadow(color: .black.opacity(0.05), radius: 5, y: 3)
-                .padding(.horizontal, 30)
-                .padding(.top)
-
-            Button(action: {
-                // We now wrap the async call in a Task
-                Task {
-                    await beginDeconstruction()
+        NavigationStack {
+            goalListView
+                .navigationTitle("My Goals")
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button(action: { isShowingAddSheet = true }) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.title2)
+                        }
+                    }
                 }
-            }) {
-                Text("Break It Down")
-                    .font(.title3)
-                    .fontWeight(.bold)
-                    .foregroundColor(.white)
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(Color.accentColor)
-                    .cornerRadius(12)
-                    .shadow(color: Color.accentColor.opacity(0.4), radius: 8, y: 5)
-            }
-            .padding(.horizontal, 30)
-            .disabled(userGoal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || currentAppState == .deconstructing)
-            
-            Spacer()
-            Spacer()
-        }
-        .padding()
-    }
-    
-    private var deconstructingView: some View {
-        VStack(spacing: 20) {
-            ProgressView()
-                .scaleEffect(1.5)
-            Text("Deconstructing your ambition...")
-                .font(.title2)
-                .foregroundColor(.secondary)
+                .sheet(isPresented: $isShowingAddSheet) {
+                    AddGoalSheet { newGoalTitle in
+                        // This closure is called when the user taps "Add Goal"
+                        Task {
+                            await addNewGoal(title: newGoalTitle)
+                        }
+                    }
+                }
+                .onAppear(perform: loadGoals) // Load goals when the view appears
+                .alert("Error", isPresented: $isShowingErrorAlert, presenting: apiError) { error in
+                    Button("OK") {}
+                } message: { error in
+                    Text(error.localizedDescription)
+                }
         }
     }
     
-    private var firstStepView: some View {
-        VStack(alignment: .center, spacing: 15) {
+    // MARK: - Subviews
+    
+    /// The main view displaying the list of user goals.
+    @ViewBuilder
+    private var goalListView: some View {
+        if goals.isEmpty {
+            // A nice placeholder for when there are no goals yet.
             VStack {
-                Text("YOUR GOAL")
-                    .font(.caption)
-                    .fontWeight(.bold)
+                Spacer()
+                Image(systemName: "moon.stars")
+                    .font(.system(size: 60))
                     .foregroundColor(.secondary)
-                Text(userGoal)
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                    .multilineTextAlignment(.center)
-                    .foregroundColor(.primary)
-            }
-            .padding(.top, 40)
-            
-            Divider().padding(.vertical)
-            
-            VStack {
-                Text("YOUR FIRST STEP")
-                    .font(.caption)
-                    .fontWeight(.bold)
+                    .padding(.bottom, 10)
+                Text("No Goals Yet")
+                    .font(.title2).bold()
+                Text("Tap the '+' to add a huge new goal and break it down into tiny steps.")
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
-                
-                Text(firstStep)
-                    .font(.system(size: 32, weight: .bold, design: .rounded))
                     .multilineTextAlignment(.center)
-                    .foregroundColor(.accentColor)
-                    .padding(.vertical)
+                    .padding(.horizontal)
+                Spacer()
+                Spacer()
             }
-            
-            Spacer()
-            
-            ShareLink(
-                item: "My huge goal: \"\(userGoal)\"\n\nMy laughably easy first step from Fractal: \"\(firstStep)\" #FractalApp"
-            ) {
-                Label("Share the Absurdity", systemImage: "square.and.arrow.up")
-                    .font(.headline)
-                    .fontWeight(.bold)
-                    .foregroundColor(.white)
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(Color.accentColor)
-                    .cornerRadius(12)
+        } else {
+            List {
+                ForEach(goals) { goal in
+                    NavigationLink(destination: GoalDetailView(goal: goal)) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(goal.title)
+                                    .font(.headline)
+                                Text(goal.isLoading ? "Breaking it down..." : "\(goal.steps.count) steps")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if goal.isLoading {
+                                ProgressView().padding(.trailing)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                }
+                .onDelete(perform: deleteGoal)
             }
-            
-            Button("I did it! (or new goal)", action: resetApp)
-                .font(.headline)
-                .padding()
-                .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal, 30)
-        .padding(.bottom)
     }
     
-    // MARK: - Logic & Actions (Major Changes Here)
-
-    /// **MODIFIED:** Now an async function that calls the Groq API.
-    private func beginDeconstruction() async {
-        hapticGenerator.impactOccurred()
+    // MARK: - Data & API Logic
+    
+    /// Adds a new goal, shows a loading state, and fetches steps from the API.
+    private func addNewGoal(title: String) async {
+        let newGoal = Goal(id: UUID(), title: title, steps: [], isLoading: true)
         
-        withAnimation {
-            currentAppState = .deconstructing
-        }
+        // Add to the list immediately for instant UI feedback
+        goals.insert(newGoal, at: 0)
+        saveGoals()
         
         do {
-            let generatedStep = try await generateFirstStepFromGroq(for: userGoal)
+            let steps = try await generateStepsFromGroq(for: title)
             
-            // Update UI on the main thread
-            await MainActor.run {
-                self.firstStep = generatedStep
-                self.hapticGenerator.impactOccurred()
-                withAnimation {
-                    self.currentAppState = .showingFirstStep
-                }
+            // Find the goal and update it with the new steps
+            if let index = goals.firstIndex(where: { $0.id == newGoal.id }) {
+                goals[index].steps = steps
+                goals[index].isLoading = false
+                saveGoals()
             }
         } catch let error as APIError {
-            // Handle known API errors
-            await MainActor.run {
-                self.apiError = error
-                self.isShowingErrorAlert = true
-                withAnimation { self.currentAppState = .enteringGoal }
-            }
+            handle(error: error)
+            // If the API fails, remove the temporary goal we added.
+            goals.removeAll { $0.id == newGoal.id }
+            saveGoals()
         } catch {
-            // Handle other unexpected errors
-            await MainActor.run {
-                self.apiError = .requestFailed(error)
-                self.isShowingErrorAlert = true
-                withAnimation { self.currentAppState = .enteringGoal }
-            }
+            handle(error: .requestFailed(error))
+            goals.removeAll { $0.id == newGoal.id }
+            saveGoals()
         }
     }
     
-    private func resetApp() {
-        withAnimation {
-            currentAppState = .enteringGoal
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            userGoal = ""
-            firstStep = ""
-        }
-    }
-    
-    // MARK: - Core AI Function (NEW - Groq API Integration)
-    
-    /// This function calls the Groq API to generate a first step.
-    private func generateFirstStepFromGroq(for goal: String) async throws -> String {
+    /// Calls the Groq API and parses the response into a list of steps.
+    private func generateStepsFromGroq(for goal: String) async throws -> [String] {
         let apiKey = Secrets.apiKey
-        guard !apiKey.isEmpty else {
-            throw APIError.missingAPIKey
-        }
-        
-        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
-            throw APIError.invalidURL
-        }
+        guard !apiKey.isEmpty else { throw APIError.missingAPIKey }
+        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { throw APIError.invalidURL }
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -301,36 +179,128 @@ struct FractalView: View {
         
         let systemPrompt = """
         You are an expert in breaking down huge, intimidating goals into laughably simple first steps.
-        Your job is to defeat procrastination by lowering 'activation energy'.
-        The user will give you a goal. Your response MUST BE ONLY the single, tiny first step.
-        It should be encouraging and almost ridiculously easy.
-        DO NOT add any extra text, explanations, or pleasantries. Just the single sentence for the step.
-        For example, if the goal is "write a book", a good response is "Open a new document and title it.".
-        If the goal is "lose 50 pounds", a good response is "Put your gym shoes by the door.".
+        The user will give you a goal. Your response MUST BE a numbered list of the first 3-5 tiny, sequential steps.
+        Each step must be on a new line. Do not add any extra text, explanations, or pleasantries.
+        Example response for goal "Learn to bake bread":
+        1. Watch a 5-minute video on "no-knead bread".
+        2. Buy a bag of flour.
+        3. Find a large bowl in your kitchen.
         """
         
-        let requestBody = GroqRequest(
-            messages: [
-                Message(role: "system", content: systemPrompt),
-                Message(role: "user", content: goal)
-            ],
-            model: "llama3-8b-8192" // The model you specified
-        )
-        
+        let requestBody = GroqRequest(messages: [Message(role: "system", content: systemPrompt), Message(role: "user", content: goal)], model: "llama3-8b-8192")
         request.httpBody = try JSONEncoder().encode(requestBody)
         
         let (data, _) = try await URLSession.shared.data(for: request)
         
         do {
             let response = try JSONDecoder().decode(GroqResponse.self, from: data)
-            if let firstChoice = response.choices.first {
-                // Clean up the response, as LLMs sometimes add extra quotes or whitespace.
-                return firstChoice.message.content.trimmingCharacters(in: .whitespacesAndNewlines.union(.init(charactersIn: "\"")))
-            } else {
-                throw APIError.noContent
+            guard let content = response.choices.first?.message.content else { throw APIError.noContent }
+            
+            // Parse the numbered list into a clean array of strings
+            let parsedSteps = content.split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .map { line -> String in
+                    // Remove "1. ", "2. ", etc. from the beginning of the line
+                    if let range = line.range(of: "^\\d+\\.\\s*", options: .regularExpression) {
+                        return String(line[range.upperBound...])
+                    }
+                    return String(line)
+                }
+            
+            guard !parsedSteps.isEmpty else { throw APIError.parsingFailed }
+            return parsedSteps
+            
+        } catch { throw APIError.decodingFailed(error) }
+    }
+    
+    // MARK: - Persistence & Helper Functions
+    
+    private func loadGoals() {
+        guard let data = goalsData else { return }
+        if let decodedGoals = try? JSONDecoder().decode([Goal].self, from: data) {
+            self.goals = decodedGoals
+        }
+    }
+    
+    private func saveGoals() {
+        if let encodedData = try? JSONEncoder().encode(goals) {
+            self.goalsData = encodedData
+        }
+    }
+    
+    private func deleteGoal(at offsets: IndexSet) {
+        goals.remove(atOffsets: offsets)
+        saveGoals()
+    }
+    
+    private func handle(error: APIError) {
+        self.apiError = error
+        self.isShowingErrorAlert = true
+    }
+}
+
+
+// MARK: - Detail and Sheet Views (Kept in this file as requested)
+
+/// A view that displays the steps for a single goal.
+struct GoalDetailView: View {
+    let goal: Goal
+    
+    var body: some View {
+        List {
+            Section(header: Text("First Steps")) {
+                if goal.steps.isEmpty && !goal.isLoading {
+                    Text("No steps generated yet. Try adding the goal again.")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(goal.steps, id: \.self) { step in
+                        HStack(alignment: .top) {
+                            Image(systemName: "circle") // Could be a checkbox later
+                                .foregroundColor(.accentColor)
+                                .padding(.top, 4)
+                            Text(step)
+                        }
+                        .padding(.vertical, 5)
+                    }
+                }
             }
-        } catch {
-            throw APIError.decodingFailed(error)
+        }
+        .navigationTitle(goal.title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A sheet view for adding a new goal.
+struct AddGoalSheet: View {
+    @Environment(\.dismiss) var dismiss
+    @State private var newGoalTitle: String = ""
+    
+    // A closure to pass the new goal title back to the parent view.
+    var onAdd: (String) -> Void
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("What's your next big goal?")) {
+                    TextField("e.g., Launch a podcast, learn to cook...", text: $newGoalTitle)
+                }
+                
+                Button("Break It Down") {
+                    if !newGoalTitle.trimmingCharacters(in: .whitespaces).isEmpty {
+                        onAdd(newGoalTitle)
+                        dismiss()
+                    }
+                }
+                .disabled(newGoalTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .navigationTitle("New Goal")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
         }
     }
 }
